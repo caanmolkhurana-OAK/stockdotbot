@@ -71,7 +71,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive with Minimal Reply Output!")
+        self.wfile.write(b"Bot is alive with 60-SMA Volume Multiple Tracking!")
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -205,6 +205,11 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
 
             rsi_val = calculate_rsi(closed_df['Close'], period=14)
 
+            # Calculate 60-period Volume Moving Average
+            vol_series = closed_df['Volume']
+            vol_sma60 = float(vol_series.iloc[-60:].mean()) if len(vol_series) >= 60 else float(vol_series.mean())
+            vol_ratio60 = (candle_volume / vol_sma60) if vol_sma60 > 0 else 1.0
+
             is_triggered = False
             if direction == "ABOVE" and close_price > target:
                 is_triggered = True
@@ -214,14 +219,15 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
             if is_triggered:
                 if alert["last_alerted_candle"] != candle_time:
                     formatted_vol = format_volume(candle_volume) if candle_volume > 0 else "N/A"
+                    vol_output = f"{formatted_vol} ({vol_ratio60:.1f}x 60-SMA)" if candle_volume > 0 else "N/A"
                     tp_val = f"{currency}{alert['tp_price']:.2f}" if alert.get("tp_price") else "N/A"
 
-                    # MINIMAL REQUIRED OUTPUT FORMAT
+                    # MINIMAL REQUIRED OUTPUT WITH 60-SMA MULTIPLE
                     msg = (
                         f"🚨 *ALERT TRIGGERED* 🚨\n\n"
                         f"• Stock: *{ticker}*\n"
                         f"• RSI: *{rsi_val}*\n"
-                        f"• Volume: *{formatted_vol}*\n"
+                        f"• Volume: *{vol_output}*\n"
                         f"• Entry Price: *{currency}{close_price:.2f}*\n"
                         f"• Target Price: *{tp_val}*"
                     )
@@ -249,5 +255,5 @@ if __name__ == "__main__":
     job_queue = app.job_queue
     job_queue.run_repeating(check_breakouts_job, interval=60, first=5)
 
-    print("🚀 @stockdotbot is online with Minimal Reply Formatting!")
+    print("🚀 @stockdotbot is online with 60-SMA Volume Multiple Output!")
     app.run_polling()
