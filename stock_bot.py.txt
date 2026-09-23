@@ -1,0 +1,173 @@
+import os
+import threading
+import logging
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import yfinance as yf
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# Logging setup
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+ACTIVE_ALERTS = []
+
+VALID_TIMEFRAMES = {
+    "5m": "5d",
+    "15m": "5d",
+    "1h": "1mo",
+    "1d": "3mo"
+}
+
+# Dummy HTTP server to keep Render Free Web Service happy
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running!")
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    print(f"Health check server listening on port {port}")
+    server.serve_forever()
+
+# Start dummy server in background thread
+threading.Thread(target=run_health_check_server, daemon=True).start()
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "🤖 *Welcome to @stockdotbot! (24/7 Render Cloud)*\n\n"
+        "Set an alert:\n"
+        "`/alert <TICKER> <TARGET_PRICE> <TIMEFRAME>`\n\n"
+        "Examples:\n"
+        "• `/alert TATAMOTORS 980 15m`\n"
+        "• `/alert GOLDBEES.NS 70.50 15m` (Gold ETF ₹)\n"
+        "• `/alert XAUUSD=X 2650 15m` (Spot Gold $)\n"
+        "• `/alert GC=F 2500 1h` (Gold Futures $)\n"
+        "• `/alert NIFTY50.NS 22500 1d`\n\n"
+        "Check alerts: `/list` | Clear all: `/clear`"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    try:
+        ticker = context.args[0].upper()
+        
+        if (not ticker.endswith(".NS") and 
+            not ticker.endswith(".BO") and 
+            "^" not in ticker and 
+            "=" not in ticker and 
+            "XAU" not in ticker and 
+            "USD" not in ticker):
+            ticker += ".NS"
+
+        target_price = float(context.args[1])
+        tf = context.args[2].lower()
+
+        if tf not in VALID_TIMEFRAMES:
+            await update.message.reply_text("❌ Invalid timeframe. Choose: `5m`, `15m`, `1h`, `1d`", parse_mode="Markdown")
+            return
+
+        alert_item = {
+            "chat_id": chat_id,
+            "ticker": ticker,
+            "target_price": target_price,
+            "timeframe": tf,
+            "last_alerted_candle": None
+        }
+        ACTIVE_ALERTS.append(alert_item)
+
+        await update.message.reply_text(
+            f"✅ *Alert Set!*\n"
+            f"• Ticker: `{ticker}`\n"
+            f"• Level: Close > `{target_price}`\n"
+            f"• Timeframe: `{tf}`",
+            parse_mode="Markdown"
+        )
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "❌ *Invalid format.*\nUse: `/alert <TICKER> <TARGET_PRICE> <TIMEFRAME>`",
+            parse_mode="Markdown"
+        )
+
+async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    user_alerts = [a for a in ACTIVE_ALERTS if a["chat_id"] == chat_id]
+
+    if not user_alerts:
+        await update.message.reply_text("No active alerts.")
+        return
+
+    text = "📋 *Active Watchlist:*\n\n"
+    for idx, a in enumerate(user_alerts, 1):
+        text += f"{idx}. `{a['ticker']}` | Target: > `{a['target_price']}` | TF: `{a['timeframe']}`\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def clear_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    global ACTIVE_ALERTS
+    ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["chat_id"] != chat_id]
+    await update.message.reply_text("🧹 Cleared all alerts.")
+
+async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
+    if not ACTIVE_ALERTS:
+        return
+
+    triggered = []
+
+    for alert in ACTIVE_ALERTS:
+        ticker = alert["ticker"]
+        target = alert["target_price"]
+        tf = alert["timeframe"]
+        period = VALID_TIMEFRAMES[tf]
+
+        try:
+            df = yf.Ticker(ticker).history(period=period, interval=tf)
+            if df.empty or len(df) < 2:
+                continue
+
+            last_closed = df.iloc[-2]
+            close_price = float(last_closed['Close'])
+            candle_time = last_closed.name.strftime('%Y-%m-%d %H:%M')
+
+            if close_price > target:
+                if alert["last_alerted_candle"] != candle_time:
+                    msg = (
+                        f"🚨 *BREAKOUT ALERT!* 🚨\n\n"
+                        f"• Ticker: *{ticker}*\n"
+                        f"• Timeframe: *{tf}*\n"
+                        f"• Candle Close: *{close_price:.2f}*\n"
+                        f"• Target Level: *{target:.2f}*\n"
+                        f"• Candle Time: `{candle_time}`"
+                    )
+                    await context.bot.send_message(chat_id=alert["chat_id"], text=msg, parse_mode="Markdown")
+                    alert["last_alerted_candle"] = candle_time
+                    triggered.append(alert)
+
+        except Exception as e:
+            logging.error(f"Error scanning {ticker}: {e}")
+
+    for alert in triggered:
+        if alert in ACTIVE_ALERTS:
+            ACTIVE_ALERTS.remove(alert)
+
+if __name__ == "__main__":
+    BOT_TOKEN = "8964779286:AAEJJfB49NFgVxR8zMOvImegNrlRaqEjcHA"
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("alert", add_alert))
+    app.add_handler(CommandHandler("list", list_alerts))
+    app.add_handler(CommandHandler("clear", clear_alerts))
+
+    job_queue = app.job_queue
+    job_queue.run_repeating(check_breakouts_job, interval=60, first=5)
+
+    print("🚀 @stockdotbot is online in Render Free Web Service!")
+    app.run_polling()
