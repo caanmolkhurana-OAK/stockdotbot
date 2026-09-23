@@ -14,14 +14,23 @@ logging.basicConfig(
 
 ACTIVE_ALERTS = []
 
+# Updated valid timeframes including 45m and 4h
 VALID_TIMEFRAMES = {
     "5m": "5d",
     "15m": "5d",
+    "45m": "1mo",
     "1h": "1mo",
+    "4h": "3mo",
     "1d": "3mo"
 }
 
-# Dummy HTTP server to keep Render Free Web Service happy
+def get_currency_symbol(ticker: str) -> str:
+    """Returns $ for international symbols/forex/commodities and ₹ for Indian stocks."""
+    if ticker.endswith(".NS") or ticker.endswith(".BO") or ticker.startswith("^NSE") or ticker.startswith("^BSE"):
+        return "₹"
+    return "$"
+
+# Lightweight HTTP server to satisfy Render Free Web Service health check
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -34,20 +43,21 @@ def run_health_check_server():
     print(f"Health check server listening on port {port}")
     server.serve_forever()
 
-# Start dummy server in background thread
 threading.Thread(target=run_health_check_server, daemon=True).start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 *Welcome to @stockdotbot! (24/7 Render Cloud)*\n\n"
+        "🤖 *Welcome to @stockdotbot! (24/7 Cloud)*\n\n"
         "Set an alert:\n"
         "`/alert <TICKER> <TARGET_PRICE> <TIMEFRAME>`\n\n"
+        "• *Target > Current Price* ➔ Triggers on **Close ABOVE** (Breakout)\n"
+        "• *Target < Current Price* ➔ Triggers on **Close BELOW** (Breakdown)\n\n"
+        "Supported Timeframes:\n"
+        "`5m`, `15m`, `45m`, `1h`, `4h`, `1d`\n\n"
         "Examples:\n"
-        "• `/alert TATAMOTORS 980 15m`\n"
-        "• `/alert GOLDBEES.NS 70.50 15m` (Gold ETF ₹)\n"
-        "• `/alert XAUUSD=X 2650 15m` (Spot Gold $)\n"
-        "• `/alert GC=F 2500 1h` (Gold Futures $)\n"
-        "• `/alert NIFTY50.NS 22500 1d`\n\n"
+        "• `/alert TATAMOTORS 980 45m` (NSE Stock in ₹)\n"
+        "• `/alert GOLDBEES.NS 68.00 4h` (Gold ETF in ₹)\n"
+        "• `/alert XAUUSD=X 2650 4h` (Spot Gold in $)\n\n"
         "Check alerts: `/list` | Clear all: `/clear`"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -55,28 +65,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     try:
-        ticker = context.args[0].upper()
+        raw_ticker = context.args[0].upper()
         
-        if (not ticker.endswith(".NS") and 
-            not ticker.endswith(".BO") and 
-            "^" not in ticker and 
-            "=" not in ticker and 
-            "XAU" not in ticker and 
-            "USD" not in ticker):
-            ticker += ".NS"
+        # SMART TICKER CLEANUP:
+        # Do not append .NS to Forex, Commodities (=), Indices (^), Gold/FX (XAU/USD), or BSE (.BO)
+        is_global_asset = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
+        
+        if not is_global_asset and not raw_ticker.endswith(".NS"):
+            ticker = raw_ticker + ".NS"
+        else:
+            ticker = raw_ticker
 
         target_price = float(context.args[1])
         tf = context.args[2].lower()
 
         if tf not in VALID_TIMEFRAMES:
-            await update.message.reply_text("❌ Invalid timeframe. Choose: `5m`, `15m`, `1h`, `1d`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Invalid timeframe. Choose: `5m`, `15m`, `45m`, `1h`, `4h`, `1d`", parse_mode="Markdown")
             return
+
+        # Fetch current price to check validity & determine direction
+        period = VALID_TIMEFRAMES[tf]
+        df = yf.Ticker(ticker).history(period=period, interval=tf)
+        if df.empty:
+            await update.message.reply_text(f"❌ Could not fetch market data for `{ticker}`. Please verify ticker name.", parse_mode="Markdown")
+            return
+
+        current_price = float(df.iloc[-1]['Close'])
+        direction = "ABOVE" if target_price >= current_price else "BELOW"
+        currency = get_currency_symbol(ticker)
 
         alert_item = {
             "chat_id": chat_id,
             "ticker": ticker,
             "target_price": target_price,
+            "direction": direction,
             "timeframe": tf,
+            "currency": currency,
             "last_alerted_candle": None
         }
         ACTIVE_ALERTS.append(alert_item)
@@ -84,7 +108,8 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ *Alert Set!*\n"
             f"• Ticker: `{ticker}`\n"
-            f"• Level: Close > `{target_price}`\n"
+            f"• Current Price: `{currency}{current_price:.2f}`\n"
+            f"• Trigger: Close **{direction}** `{currency}{target_price:.2f}`\n"
             f"• Timeframe: `{tf}`",
             parse_mode="Markdown"
         )
@@ -104,7 +129,8 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = "📋 *Active Watchlist:*\n\n"
     for idx, a in enumerate(user_alerts, 1):
-        text += f"{idx}. `{a['ticker']}` | Target: > `{a['target_price']}` | TF: `{a['timeframe']}`\n"
+        curr = a.get("currency", "$")
+        text += f"{idx}. `{a['ticker']}` | Target: {a['direction']} `{curr}{a['target_price']}` | TF: `{a['timeframe']}`\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -123,7 +149,9 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
     for alert in ACTIVE_ALERTS:
         ticker = alert["ticker"]
         target = alert["target_price"]
+        direction = alert["direction"]
         tf = alert["timeframe"]
+        currency = alert.get("currency", "$")
         period = VALID_TIMEFRAMES[tf]
 
         try:
@@ -135,14 +163,21 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
             close_price = float(last_closed['Close'])
             candle_time = last_closed.name.strftime('%Y-%m-%d %H:%M')
 
-            if close_price > target:
+            is_triggered = False
+            if direction == "ABOVE" and close_price > target:
+                is_triggered = True
+            elif direction == "BELOW" and close_price < target:
+                is_triggered = True
+
+            if is_triggered:
                 if alert["last_alerted_candle"] != candle_time:
                     msg = (
-                        f"🚨 *BREAKOUT ALERT!* 🚨\n\n"
+                        f"🚨 *PRICE ALERT TRIGGERED!* 🚨\n\n"
                         f"• Ticker: *{ticker}*\n"
                         f"• Timeframe: *{tf}*\n"
-                        f"• Candle Close: *{close_price:.2f}*\n"
-                        f"• Target Level: *{target:.2f}*\n"
+                        f"• Condition: Close *{direction}* target\n"
+                        f"• Candle Close: *{currency}{close_price:.2f}*\n"
+                        f"• Target Level: *{currency}{target:.2f}*\n"
                         f"• Candle Time: `{candle_time}`"
                     )
                     await context.bot.send_message(chat_id=alert["chat_id"], text=msg, parse_mode="Markdown")
