@@ -73,7 +73,7 @@ def get_fetch_ticker(ticker: str, timeframe: str = "1d") -> str:
     return ticker
 
 def fetch_candle_data(ticker: str, tf: str) -> pd.DataFrame:
-    """Fetches data from yfinance and applies 45m resampling when requested."""
+    """Safely fetches candle data without throwing exceptions."""
     if tf not in VALID_TIMEFRAMES:
         return pd.DataFrame()
 
@@ -82,10 +82,9 @@ def fetch_candle_data(ticker: str, tf: str) -> pd.DataFrame:
 
     try:
         df = yf.Ticker(fetch_sym).history(period=period, interval=yf_interval)
-        if df.empty:
+        if df is None or df.empty:
             return pd.DataFrame()
 
-        # Custom 45m candle resampling from 15m base data
         if tf == "45m":
             df_45m = df.resample('45min').agg({
                 'Open': 'first',
@@ -133,7 +132,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Unified Stock Bot with 45m Resampling is running!")
+        self.wfile.write(b"Bot is alive!")
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -148,7 +147,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Welcome to @stockdotbot!*\n\n"
         "1️⃣ *Set Price Breakout Alert:*\n"
         "`/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`\n"
-        "• Example: `/alert GREAVESCOT 209 45m 221`\n\n"
+        "• Example: `/alert ALBERTDEV 916 1d 1054`\n\n"
         "2️⃣ *Set Trade Target:*\n"
         "`/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`\n"
         "• Example: `/trade TEXRAIL 127.20 143`\n\n"
@@ -179,8 +178,8 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tp_price = float(context.args[3]) if len(context.args) > 3 else None
         
         df = fetch_candle_data(ticker, tf)
-        if df.empty:
-            await update.message.reply_text(f"❌ Could not fetch data for `{ticker}`. Check ticker symbol (e.g. `GREAVESCOT`).", parse_mode="Markdown")
+        if df.empty or len(df) == 0:
+            await update.message.reply_text(f"❌ Could not fetch data for `{ticker}`. Check NSE symbol (e.g. `ALBERTDEV`).", parse_mode="Markdown")
             return
 
         current_price = float(df.iloc[-1]['Close'])
@@ -210,7 +209,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply_msg, parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Error in add_alert: {e}")
-        await update.message.reply_text("❌ Format error. Syntax: `/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Failed to set alert. Check your input syntax.", parse_mode="Markdown")
 
 async def add_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -246,7 +245,7 @@ async def add_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply_msg, parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Error in add_trade: {e}")
-        await update.message.reply_text("❌ Format error. Syntax: `/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Failed to set trade. Syntax: `/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`", parse_mode="Markdown")
 
 async def list_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -433,5 +432,5 @@ if __name__ == "__main__":
     job_queue = app.job_queue
     job_queue.run_repeating(scanner_job, interval=60, first=5)
 
-    print("🚀 Bot safely running with 45m Candle Resampling!")
+    print("🚀 Crash-proof Bot online!")
     app.run_polling()
