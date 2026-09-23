@@ -2,6 +2,7 @@ import os
 import threading
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import pandas as pd
 import yfinance as yf
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -14,7 +15,6 @@ logging.basicConfig(
 
 ACTIVE_ALERTS = []
 
-# Periods tailored to ensure 60+ historical candles for 60-SMA calculations
 VALID_TIMEFRAMES = {
     "5m": "5d",
     "15m": "5d",
@@ -44,12 +44,34 @@ def format_volume(volume: float) -> str:
         return f"{volume / 1_000:.1f}K"
     return f"{int(volume)}"
 
+def calculate_rsi(close_series: pd.Series, period: int = 14) -> float:
+    """Calculates standard 14-period Relative Strength Index (RSI)."""
+    if len(close_series) < period + 1:
+        return 50.0
+    
+    delta = close_series.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+
+    avg_gain = gain.iloc[1:period+1].mean()
+    avg_loss = loss.iloc[1:period+1].mean()
+
+    for i in range(period + 1, len(close_series)):
+        avg_gain = (avg_gain * (period - 1) + gain.iloc[i]) / period
+        avg_loss = (avg_loss * (period - 1) + loss.iloc[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    
+    rs = avg_gain / avg_loss
+    return round(100.0 - (100.0 / (1.0 + rs)), 1)
+
 # Lightweight HTTP server to satisfy Render Free Web Service health check
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive with 60-SMA Volume Tracking!")
+        self.wfile.write(b"Bot is alive with Minimal Reply Output!")
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -61,16 +83,12 @@ threading.Thread(target=run_health_check_server, daemon=True).start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 *Welcome to @stockdotbot! (60-SMA Volume Edition)*\n\n"
+        "🤖 *Welcome to @stockdotbot!*\n\n"
         "Set an alert:\n"
-        "`/alert <TICKER> <TARGET_PRICE> <TIMEFRAME>`\n\n"
-        "• *Target > Current Price* ➔ Close **ABOVE** (Breakout)\n"
-        "• *Target < Current Price* ➔ Close **BELOW** (Breakdown)\n\n"
-        "Supported Timeframes:\n"
-        "`5m`, `15m`, `45m`, `1h`, `4h`, `1d`\n\n"
+        "`/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`\n\n"
         "Examples:\n"
-        "• `/alert TATAMOTORS 980 15m` (NSE Stock in ₹)\n"
-        "• `/alert XAUUSD=X 2650 15m` (Spot Gold in $)\n\n"
+        "• `/alert TATAMOTORS 980 15m 1020`\n"
+        "• `/alert XAUUSD=X 2650 15m 2700`\n\n"
         "Check alerts: `/list` | Clear all: `/clear`"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -81,7 +99,6 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raw_ticker = context.args[0].upper()
         
         is_global_asset = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
-        
         if not is_global_asset and not raw_ticker.endswith(".NS"):
             ticker = raw_ticker + ".NS"
         else:
@@ -94,12 +111,14 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid timeframe. Choose: `5m`, `15m`, `45m`, `1h`, `4h`, `1d`", parse_mode="Markdown")
             return
 
+        tp_price = float(context.args[3]) if len(context.args) > 3 else None
+
         fetch_ticker = get_fetch_ticker(ticker, tf)
         period = VALID_TIMEFRAMES[tf]
         
         df = yf.Ticker(fetch_ticker).history(period=period, interval=tf)
         if df.empty:
-            await update.message.reply_text(f"❌ Could not fetch live data for `{ticker}`. Verify ticker or market hours.", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ Could not fetch live data for `{ticker}`.", parse_mode="Markdown")
             return
 
         current_price = float(df.iloc[-1]['Close'])
@@ -114,21 +133,24 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "direction": direction,
             "timeframe": tf,
             "currency": currency,
+            "tp_price": tp_price,
             "last_alerted_candle": None
         }
         ACTIVE_ALERTS.append(alert_item)
 
-        await update.message.reply_text(
-            f"✅ *Alert Set (60-SMA Volume Enabled)!*\n"
-            f"• Ticker: `{ticker}`\n"
-            f"• Current Price: `{currency}{current_price:.2f}`\n"
-            f"• Trigger: Close **{direction}** `{currency}{target_price:.2f}`\n"
-            f"• Timeframe: `{tf}`",
-            parse_mode="Markdown"
+        reply_msg = (
+            f"✅ *Alert Set!*\n"
+            f"• Stock: `{ticker}`\n"
+            f"• Trigger Level: `{currency}{target_price:.2f}` ({direction})\n"
+            f"• Timeframe: `{tf}`"
         )
+        if tp_price:
+            reply_msg += f"\n• Target Price: `{currency}{tp_price:.2f}`"
+
+        await update.message.reply_text(reply_msg, parse_mode="Markdown")
     except (IndexError, ValueError):
         await update.message.reply_text(
-            "❌ *Invalid format.*\nUse: `/alert <TICKER> <TARGET_PRICE> <TIMEFRAME>`",
+            "❌ *Invalid format.*\nUse: `/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`",
             parse_mode="Markdown"
         )
 
@@ -143,7 +165,8 @@ async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📋 *Active Watchlist:*\n\n"
     for idx, a in enumerate(user_alerts, 1):
         curr = a.get("currency", "$")
-        text += f"{idx}. `{a['ticker']}` | Target: {a['direction']} `{curr}{a['target_price']}` | TF: `{a['timeframe']}`\n"
+        tp_str = f" | Target: `{curr}{a['tp_price']}`" if a.get("tp_price") else ""
+        text += f"{idx}. `{a['ticker']}` | Trigger: {a['direction']} `{curr}{a['target_price']}` | TF: `{a['timeframe']}`{tp_str}\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -173,15 +196,14 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
             if df.empty or len(df) < 2:
                 continue
 
-            last_closed = df.iloc[-2]
+            closed_df = df.iloc[:-1]
+            last_closed = closed_df.iloc[-1]
+            
             close_price = float(last_closed['Close'])
             candle_volume = float(last_closed['Volume'])
             candle_time = last_closed.name.strftime('%Y-%m-%d %H:%M')
 
-            # Calculate 60-period Volume Moving Average
-            vol_series = df['Volume'].iloc[:-1]  # Exclude current active/incomplete bar
-            vol_sma60 = float(vol_series.iloc[-60:].mean()) if len(vol_series) >= 60 else float(vol_series.mean())
-            vol_ratio60 = (candle_volume / vol_sma60) if vol_sma60 > 0 else 1.0
+            rsi_val = calculate_rsi(closed_df['Close'], period=14)
 
             is_triggered = False
             if direction == "ABOVE" and close_price > target:
@@ -191,21 +213,17 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
 
             if is_triggered:
                 if alert["last_alerted_candle"] != candle_time:
-                    formatted_vol = format_volume(candle_volume)
-                    if candle_volume > 0:
-                        vol_text = f"{formatted_vol} ({vol_ratio60:.1f}x 60-SMA Avg)"
-                    else:
-                        vol_text = "N/A"
+                    formatted_vol = format_volume(candle_volume) if candle_volume > 0 else "N/A"
+                    tp_val = f"{currency}{alert['tp_price']:.2f}" if alert.get("tp_price") else "N/A"
 
+                    # MINIMAL REQUIRED OUTPUT FORMAT
                     msg = (
-                        f"🚨 *PRICE ALERT TRIGGERED!* 🚨\n\n"
-                        f"• Ticker: *{ticker}*\n"
-                        f"• Timeframe: *{tf}*\n"
-                        f"• Condition: Close *{direction}* target\n"
-                        f"• Candle Close: *{currency}{close_price:.2f}*\n"
-                        f"• Target Level: *{currency}{target:.2f}*\n"
-                        f"• Candle Volume: *{vol_text}* 📊\n"
-                        f"• Candle Time: `{candle_time}`"
+                        f"🚨 *ALERT TRIGGERED* 🚨\n\n"
+                        f"• Stock: *{ticker}*\n"
+                        f"• RSI: *{rsi_val}*\n"
+                        f"• Volume: *{formatted_vol}*\n"
+                        f"• Entry Price: *{currency}{close_price:.2f}*\n"
+                        f"• Target Price: *{tp_val}*"
                     )
                     await context.bot.send_message(chat_id=alert["chat_id"], text=msg, parse_mode="Markdown")
                     alert["last_alerted_candle"] = candle_time
@@ -231,5 +249,5 @@ if __name__ == "__main__":
     job_queue = app.job_queue
     job_queue.run_repeating(check_breakouts_job, interval=60, first=5)
 
-    print("🚀 @stockdotbot is online with 60-SMA Volume Analysis!")
+    print("🚀 @stockdotbot is online with Minimal Reply Formatting!")
     app.run_polling()
