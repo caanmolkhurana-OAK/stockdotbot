@@ -14,14 +14,14 @@ logging.basicConfig(
 
 ACTIVE_ALERTS = []
 
-# Updated valid timeframes including 45m and 4h
+# Periods tailored to ensure 60+ historical candles for 60-SMA calculations
 VALID_TIMEFRAMES = {
     "5m": "5d",
     "15m": "5d",
     "45m": "1mo",
     "1h": "1mo",
     "4h": "3mo",
-    "1d": "3mo"
+    "1d": "6mo"
 }
 
 def get_currency_symbol(ticker: str) -> str:
@@ -30,12 +30,26 @@ def get_currency_symbol(ticker: str) -> str:
         return "₹"
     return "$"
 
+def get_fetch_ticker(ticker: str, timeframe: str) -> str:
+    """Uses GC=F for intraday Spot Gold requests to bypass Yahoo Finance API limits."""
+    if ticker in ["XAUUSD=X", "XAUUSD"] and timeframe in ["5m", "15m", "45m"]:
+        return "GC=F"
+    return ticker
+
+def format_volume(volume: float) -> str:
+    """Formats raw numbers into financial notation (K, M)."""
+    if volume >= 1_000_000:
+        return f"{volume / 1_000_000:.2f}M"
+    elif volume >= 1_000:
+        return f"{volume / 1_000:.1f}K"
+    return f"{int(volume)}"
+
 # Lightweight HTTP server to satisfy Render Free Web Service health check
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive and running!")
+        self.wfile.write(b"Bot is alive with 60-SMA Volume Tracking!")
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -47,17 +61,16 @@ threading.Thread(target=run_health_check_server, daemon=True).start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 *Welcome to @stockdotbot! (24/7 Cloud)*\n\n"
+        "🤖 *Welcome to @stockdotbot! (60-SMA Volume Edition)*\n\n"
         "Set an alert:\n"
         "`/alert <TICKER> <TARGET_PRICE> <TIMEFRAME>`\n\n"
-        "• *Target > Current Price* ➔ Triggers on **Close ABOVE** (Breakout)\n"
-        "• *Target < Current Price* ➔ Triggers on **Close BELOW** (Breakdown)\n\n"
+        "• *Target > Current Price* ➔ Close **ABOVE** (Breakout)\n"
+        "• *Target < Current Price* ➔ Close **BELOW** (Breakdown)\n\n"
         "Supported Timeframes:\n"
         "`5m`, `15m`, `45m`, `1h`, `4h`, `1d`\n\n"
         "Examples:\n"
-        "• `/alert TATAMOTORS 980 45m` (NSE Stock in ₹)\n"
-        "• `/alert GOLDBEES.NS 68.00 4h` (Gold ETF in ₹)\n"
-        "• `/alert XAUUSD=X 2650 4h` (Spot Gold in $)\n\n"
+        "• `/alert TATAMOTORS 980 15m` (NSE Stock in ₹)\n"
+        "• `/alert XAUUSD=X 2650 15m` (Spot Gold in $)\n\n"
         "Check alerts: `/list` | Clear all: `/clear`"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -67,8 +80,6 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raw_ticker = context.args[0].upper()
         
-        # SMART TICKER CLEANUP:
-        # Do not append .NS to Forex, Commodities (=), Indices (^), Gold/FX (XAU/USD), or BSE (.BO)
         is_global_asset = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
         
         if not is_global_asset and not raw_ticker.endswith(".NS"):
@@ -83,11 +94,12 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Invalid timeframe. Choose: `5m`, `15m`, `45m`, `1h`, `4h`, `1d`", parse_mode="Markdown")
             return
 
-        # Fetch current price to check validity & determine direction
+        fetch_ticker = get_fetch_ticker(ticker, tf)
         period = VALID_TIMEFRAMES[tf]
-        df = yf.Ticker(ticker).history(period=period, interval=tf)
+        
+        df = yf.Ticker(fetch_ticker).history(period=period, interval=tf)
         if df.empty:
-            await update.message.reply_text(f"❌ Could not fetch market data for `{ticker}`. Please verify ticker name.", parse_mode="Markdown")
+            await update.message.reply_text(f"❌ Could not fetch live data for `{ticker}`. Verify ticker or market hours.", parse_mode="Markdown")
             return
 
         current_price = float(df.iloc[-1]['Close'])
@@ -97,6 +109,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert_item = {
             "chat_id": chat_id,
             "ticker": ticker,
+            "fetch_ticker": fetch_ticker,
             "target_price": target_price,
             "direction": direction,
             "timeframe": tf,
@@ -106,7 +119,7 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ACTIVE_ALERTS.append(alert_item)
 
         await update.message.reply_text(
-            f"✅ *Alert Set!*\n"
+            f"✅ *Alert Set (60-SMA Volume Enabled)!*\n"
             f"• Ticker: `{ticker}`\n"
             f"• Current Price: `{currency}{current_price:.2f}`\n"
             f"• Trigger: Close **{direction}** `{currency}{target_price:.2f}`\n"
@@ -148,6 +161,7 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
 
     for alert in ACTIVE_ALERTS:
         ticker = alert["ticker"]
+        fetch_ticker = alert.get("fetch_ticker", ticker)
         target = alert["target_price"]
         direction = alert["direction"]
         tf = alert["timeframe"]
@@ -155,13 +169,19 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
         period = VALID_TIMEFRAMES[tf]
 
         try:
-            df = yf.Ticker(ticker).history(period=period, interval=tf)
+            df = yf.Ticker(fetch_ticker).history(period=period, interval=tf)
             if df.empty or len(df) < 2:
                 continue
 
             last_closed = df.iloc[-2]
             close_price = float(last_closed['Close'])
+            candle_volume = float(last_closed['Volume'])
             candle_time = last_closed.name.strftime('%Y-%m-%d %H:%M')
+
+            # Calculate 60-period Volume Moving Average
+            vol_series = df['Volume'].iloc[:-1]  # Exclude current active/incomplete bar
+            vol_sma60 = float(vol_series.iloc[-60:].mean()) if len(vol_series) >= 60 else float(vol_series.mean())
+            vol_ratio60 = (candle_volume / vol_sma60) if vol_sma60 > 0 else 1.0
 
             is_triggered = False
             if direction == "ABOVE" and close_price > target:
@@ -171,6 +191,12 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
 
             if is_triggered:
                 if alert["last_alerted_candle"] != candle_time:
+                    formatted_vol = format_volume(candle_volume)
+                    if candle_volume > 0:
+                        vol_text = f"{formatted_vol} ({vol_ratio60:.1f}x 60-SMA Avg)"
+                    else:
+                        vol_text = "N/A"
+
                     msg = (
                         f"🚨 *PRICE ALERT TRIGGERED!* 🚨\n\n"
                         f"• Ticker: *{ticker}*\n"
@@ -178,6 +204,7 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
                         f"• Condition: Close *{direction}* target\n"
                         f"• Candle Close: *{currency}{close_price:.2f}*\n"
                         f"• Target Level: *{currency}{target:.2f}*\n"
+                        f"• Candle Volume: *{vol_text}* 📊\n"
                         f"• Candle Time: `{candle_time}`"
                     )
                     await context.bot.send_message(chat_id=alert["chat_id"], text=msg, parse_mode="Markdown")
@@ -204,5 +231,5 @@ if __name__ == "__main__":
     job_queue = app.job_queue
     job_queue.run_repeating(check_breakouts_job, interval=60, first=5)
 
-    print("🚀 @stockdotbot is online in Render Free Web Service!")
+    print("🚀 @stockdotbot is online with 60-SMA Volume Analysis!")
     app.run_polling()
