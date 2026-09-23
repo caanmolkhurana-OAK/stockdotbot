@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import threading
 import logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -13,7 +14,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-ACTIVE_ALERTS = []
+DB_FILE = "alerts.db"
 
 VALID_TIMEFRAMES = {
     "5m": "5d",
@@ -24,20 +25,40 @@ VALID_TIMEFRAMES = {
     "1d": "6mo"
 }
 
+# Database Initialization
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            ticker TEXT,
+            fetch_ticker TEXT,
+            target_price REAL,
+            direction TEXT,
+            timeframe TEXT,
+            currency TEXT,
+            tp_price REAL,
+            last_alerted_candle TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
 def get_currency_symbol(ticker: str) -> str:
-    """Returns $ for international symbols/forex/commodities and ₹ for Indian stocks."""
     if ticker.endswith(".NS") or ticker.endswith(".BO") or ticker.startswith("^NSE") or ticker.startswith("^BSE"):
         return "₹"
     return "$"
 
 def get_fetch_ticker(ticker: str, timeframe: str) -> str:
-    """Uses GC=F for intraday Spot Gold requests to bypass Yahoo Finance API limits."""
     if ticker in ["XAUUSD=X", "XAUUSD"] and timeframe in ["5m", "15m", "45m"]:
         return "GC=F"
     return ticker
 
 def format_volume(volume: float) -> str:
-    """Formats raw numbers into financial notation (K, M)."""
     if volume >= 1_000_000:
         return f"{volume / 1_000_000:.2f}M"
     elif volume >= 1_000:
@@ -45,7 +66,6 @@ def format_volume(volume: float) -> str:
     return f"{int(volume)}"
 
 def calculate_rsi(close_series: pd.Series, period: int = 14) -> float:
-    """Calculates standard 14-period Relative Strength Index (RSI)."""
     if len(close_series) < period + 1:
         return 50.0
     
@@ -66,12 +86,12 @@ def calculate_rsi(close_series: pd.Series, period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return round(100.0 - (100.0 / (1.0 + rs)), 1)
 
-# Lightweight HTTP server to satisfy Render Free Web Service health check
+# Health Check Server for Render
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive with 60-SMA Volume Multiple Tracking!")
+        self.wfile.write(b"Bot is alive with SQLite Persistent Alerts!")
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -83,7 +103,7 @@ threading.Thread(target=run_health_check_server, daemon=True).start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 *Welcome to @stockdotbot!*\n\n"
+        "🤖 *Welcome to @stockdotbot! (Persistent Edition)*\n\n"
         "Set an alert:\n"
         "`/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`\n\n"
         "Examples:\n"
@@ -125,21 +145,18 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = "ABOVE" if target_price >= current_price else "BELOW"
         currency = get_currency_symbol(ticker)
 
-        alert_item = {
-            "chat_id": chat_id,
-            "ticker": ticker,
-            "fetch_ticker": fetch_ticker,
-            "target_price": target_price,
-            "direction": direction,
-            "timeframe": tf,
-            "currency": currency,
-            "tp_price": tp_price,
-            "last_alerted_candle": None
-        }
-        ACTIVE_ALERTS.append(alert_item)
+        # Save alert directly to SQLite Database
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO alerts (chat_id, ticker, fetch_ticker, target_price, direction, timeframe, currency, tp_price, last_alerted_candle)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        ''', (chat_id, ticker, fetch_ticker, target_price, direction, tf, currency, tp_price))
+        conn.commit()
+        conn.close()
 
         reply_msg = (
-            f"✅ *Alert Set!*\n"
+            f"✅ *Alert Saved to Database!*\n"
             f"• Stock: `{ticker}`\n"
             f"• Trigger Level: `{currency}{target_price:.2f}` ({direction})\n"
             f"• Timeframe: `{tf}`"
@@ -156,39 +173,50 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    user_alerts = [a for a in ACTIVE_ALERTS if a["chat_id"] == chat_id]
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT ticker, direction, currency, target_price, timeframe, tp_price FROM alerts WHERE chat_id = ?", (chat_id,))
+    rows = cursor.fetchall()
+    conn.close()
 
-    if not user_alerts:
+    if not rows:
         await update.message.reply_text("No active alerts.")
         return
 
-    text = "📋 *Active Watchlist:*\n\n"
-    for idx, a in enumerate(user_alerts, 1):
-        curr = a.get("currency", "$")
-        tp_str = f" | Target: `{curr}{a['tp_price']}`" if a.get("tp_price") else ""
-        text += f"{idx}. `{a['ticker']}` | Trigger: {a['direction']} `{curr}{a['target_price']}` | TF: `{a['timeframe']}`{tp_str}\n"
+    text = "📋 *Active Watchlist (Persistent):*\n\n"
+    for idx, row in enumerate(rows, 1):
+        ticker, direction, curr, target_price, tf, tp_price = row
+        tp_str = f" | Target: `{curr}{tp_price}`" if tp_price else ""
+        text += f"{idx}. `{ticker}` | Trigger: {direction} `{curr}{target_price}` | TF: `{tf}`{tp_str}\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def clear_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    global ACTIVE_ALERTS
-    ACTIVE_ALERTS = [a for a in ACTIVE_ALERTS if a["chat_id"] != chat_id]
-    await update.message.reply_text("🧹 Cleared all alerts.")
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM alerts WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text("🧹 Cleared all alerts from database.")
 
 async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
-    if not ACTIVE_ALERTS:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, chat_id, ticker, fetch_ticker, target_price, direction, timeframe, currency, tp_price, last_alerted_candle FROM alerts")
+    alerts = cursor.fetchall()
+    conn.close()
+
+    if not alerts:
         return
 
-    triggered = []
+    triggered_ids = []
 
-    for alert in ACTIVE_ALERTS:
-        ticker = alert["ticker"]
-        fetch_ticker = alert.get("fetch_ticker", ticker)
-        target = alert["target_price"]
-        direction = alert["direction"]
-        tf = alert["timeframe"]
-        currency = alert.get("currency", "$")
+    for alert in alerts:
+        alert_id, chat_id, ticker, fetch_ticker, target, direction, tf, currency, tp_price, last_alerted_candle = alert
         period = VALID_TIMEFRAMES[tf]
 
         try:
@@ -205,7 +233,6 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
 
             rsi_val = calculate_rsi(closed_df['Close'], period=14)
 
-            # Calculate 60-period Volume Moving Average
             vol_series = closed_df['Volume']
             vol_sma60 = float(vol_series.iloc[-60:].mean()) if len(vol_series) >= 60 else float(vol_series.mean())
             vol_ratio60 = (candle_volume / vol_sma60) if vol_sma60 > 0 else 1.0
@@ -217,12 +244,11 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
                 is_triggered = True
 
             if is_triggered:
-                if alert["last_alerted_candle"] != candle_time:
+                if last_alerted_candle != candle_time:
                     formatted_vol = format_volume(candle_volume) if candle_volume > 0 else "N/A"
                     vol_output = f"{formatted_vol} ({vol_ratio60:.1f}x 60-SMA)" if candle_volume > 0 else "N/A"
-                    tp_val = f"{currency}{alert['tp_price']:.2f}" if alert.get("tp_price") else "N/A"
+                    tp_val = f"{currency}{tp_price:.2f}" if tp_price else "N/A"
 
-                    # MINIMAL REQUIRED OUTPUT WITH 60-SMA MULTIPLE
                     msg = (
                         f"🚨 *ALERT TRIGGERED* 🚨\n\n"
                         f"• Stock: *{ticker}*\n"
@@ -231,16 +257,19 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
                         f"• Entry Price: *{currency}{close_price:.2f}*\n"
                         f"• Target Price: *{tp_val}*"
                     )
-                    await context.bot.send_message(chat_id=alert["chat_id"], text=msg, parse_mode="Markdown")
-                    alert["last_alerted_candle"] = candle_time
-                    triggered.append(alert)
+                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                    triggered_ids.append(alert_id)
 
         except Exception as e:
             logging.error(f"Error scanning {ticker}: {e}")
 
-    for alert in triggered:
-        if alert in ACTIVE_ALERTS:
-            ACTIVE_ALERTS.remove(alert)
+    # Delete triggered alerts from database
+    if triggered_ids:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.executemany("DELETE FROM alerts WHERE id = ?", [(aid,) for aid in triggered_ids])
+        conn.commit()
+        conn.close()
 
 if __name__ == "__main__":
     BOT_TOKEN = "8964779286:AAEJJfB49NFgVxR8zMOvImegNrlRaqEjcHA"
@@ -255,5 +284,5 @@ if __name__ == "__main__":
     job_queue = app.job_queue
     job_queue.run_repeating(check_breakouts_job, interval=60, first=5)
 
-    print("🚀 @stockdotbot is online with 60-SMA Volume Multiple Output!")
+    print("🚀 @stockdotbot is online with SQLite database persistence!")
     app.run_polling()
