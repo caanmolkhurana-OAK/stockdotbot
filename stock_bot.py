@@ -145,107 +145,120 @@ threading.Thread(target=run_health_check_server, daemon=True).start()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "🤖 *Welcome to @stockdotbot!*\n\n"
-        "1️⃣ *Set Price Breakout Alert:*\n"
-        "`/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`\n"
-        "• Example: `/alert ALBERTDEV 916 1d 1054`\n\n"
-        "2️⃣ *Set Trade Target:*\n"
-        "`/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`\n"
-        "• Example: `/trade TEXRAIL 127.20 143`\n\n"
+        "1️⃣ *Set Price Alerts (Single or Multi-line):*\n"
+        "`/alert TICKER TRIGGER TIMEFRAME [TARGET]`\n\n"
+        "2️⃣ *Set Trade Targets (Single or Multi-line):*\n"
+        "`/trade TICKER ENTRY TARGET`\n\n"
         "📋 *Management Commands:*\n"
-        "• `/list` - View active alerts & trade targets with Live CMP\n"
-        "• `/clear` - Wipe all active alerts & trade targets"
+        "• `/list` - View active watchlist with Live CMP\n"
+        "• `/clear` - Wipe all active alerts & trades"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    try:
-        if len(context.args) < 3:
-            await update.message.reply_text("❌ Usage: `/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`", parse_mode="Markdown")
-            return
+    raw_text = update.message.text
+    lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
 
-        raw_ticker = context.args[0].upper()
-        is_global = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
-        ticker = raw_ticker if is_global else (raw_ticker if raw_ticker.endswith(".NS") else raw_ticker + ".NS")
+    saved_count = 0
+    errors = []
 
-        target_price = float(context.args[1])
-        tf = context.args[2].lower()
-
-        if tf not in VALID_TIMEFRAMES:
-            await update.message.reply_text("❌ Invalid timeframe. Choose: `5m`, `15m`, `30m`, `45m`, `1h`, `4h`, `1d`", parse_mode="Markdown")
-            return
-
-        tp_price = float(context.args[3]) if len(context.args) > 3 else None
+    for line in lines:
+        parts = line.split()
+        if parts[0].startswith('/alert'):
+            parts = parts[1:]
         
-        df = fetch_candle_data(ticker, tf)
-        if df.empty or len(df) == 0:
-            await update.message.reply_text(f"❌ Could not fetch data for `{ticker}`. Check NSE symbol (e.g. `ALBERTDEV`).", parse_mode="Markdown")
-            return
+        if len(parts) < 3:
+            continue
 
-        current_price = float(df.iloc[-1]['Close'])
-        direction = "ABOVE" if target_price >= current_price else "BELOW"
-        currency = get_currency_symbol(ticker)
-        fetch_ticker = get_fetch_ticker(ticker, tf)
+        try:
+            raw_ticker = parts[0].upper()
+            is_global = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
+            ticker = raw_ticker if is_global else (raw_ticker if raw_ticker.endswith(".NS") else raw_ticker + ".NS")
 
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO alerts (chat_id, ticker, fetch_ticker, target_price, direction, timeframe, currency, tp_price, last_alerted_candle)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-        ''', (chat_id, ticker, fetch_ticker, target_price, direction, tf, currency, tp_price))
-        conn.commit()
-        conn.close()
+            target_price = float(parts[1])
+            tf = parts[2].lower()
 
-        reply_msg = (
-            f"✅ *Alert Saved!*\n"
-            f"• Stock: `{ticker}`\n"
-            f"• CMP: `{currency}{current_price:.2f}`\n"
-            f"• Trigger Level: `{currency}{target_price:.2f}` ({direction})\n"
-            f"• Timeframe: `{tf}`"
-        )
-        if tp_price:
-            reply_msg += f"\n• Target Price: `{currency}{tp_price:.2f}`"
+            if tf not in VALID_TIMEFRAMES:
+                errors.append(f"Invalid TF for `{ticker}`")
+                continue
 
-        await update.message.reply_text(reply_msg, parse_mode="Markdown")
-    except Exception as e:
-        logging.error(f"Error in add_alert: {e}")
-        await update.message.reply_text("❌ Failed to set alert. Check your input syntax.", parse_mode="Markdown")
+            tp_price = float(parts[3]) if len(parts) > 3 else None
+            df = fetch_candle_data(ticker, tf)
+            if df.empty:
+                errors.append(f"Symbol not found: `{ticker}`")
+                continue
+
+            current_price = float(df.iloc[-1]['Close'])
+            direction = "ABOVE" if target_price >= current_price else "BELOW"
+            currency = get_currency_symbol(ticker)
+            fetch_ticker = get_fetch_ticker(ticker, tf)
+
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO alerts (chat_id, ticker, fetch_ticker, target_price, direction, timeframe, currency, tp_price, last_alerted_candle)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ''', (chat_id, ticker, fetch_ticker, target_price, direction, tf, currency, tp_price))
+            conn.commit()
+            conn.close()
+
+            saved_count += 1
+        except Exception as e:
+            logging.error(f"Error parsing alert line '{line}': {e}")
+            errors.append(f"Failed line: `{line}`")
+
+    reply_msg = f"✅ Saved *{saved_count}* alert(s)!"
+    if errors:
+        reply_msg += "\n\n⚠️ *Issues:* \n" + "\n".join(errors)
+
+    await update.message.reply_text(reply_msg, parse_mode="Markdown")
 
 async def add_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    try:
-        if len(context.args) < 3:
-            await update.message.reply_text("❌ Usage: `/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`", parse_mode="Markdown")
-            return
+    raw_text = update.message.text
+    lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
 
-        raw_ticker = context.args[0].upper()
-        is_global = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
-        ticker = raw_ticker if is_global else (raw_ticker if raw_ticker.endswith(".NS") else raw_ticker + ".NS")
+    saved_count = 0
+    errors = []
 
-        entry_price = float(context.args[1])
-        target_price = float(context.args[2])
-        fetch_ticker = get_fetch_ticker(ticker, "1d")
-        currency = get_currency_symbol(ticker)
+    for line in lines:
+        parts = line.split()
+        if parts[0].startswith('/trade'):
+            parts = parts[1:]
 
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO trades (chat_id, ticker, fetch_ticker, entry_price, target_price, currency, status, last_alerted_candle)
-            VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', NULL)
-        ''', (chat_id, ticker, fetch_ticker, entry_price, target_price, currency))
-        conn.commit()
-        conn.close()
+        if len(parts) < 3:
+            continue
 
-        reply_msg = (
-            f"🎯 *Trade Target Active!*\n"
-            f"• Stock: `{ticker}`\n"
-            f"• Entry Price: `{currency}{entry_price:.2f}`\n"
-            f"• Target Price: `{currency}{target_price:.2f}` 🎯"
-        )
-        await update.message.reply_text(reply_msg, parse_mode="Markdown")
-    except Exception as e:
-        logging.error(f"Error in add_trade: {e}")
-        await update.message.reply_text("❌ Failed to set trade. Syntax: `/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`", parse_mode="Markdown")
+        try:
+            raw_ticker = parts[0].upper()
+            is_global = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
+            ticker = raw_ticker if is_global else (raw_ticker if raw_ticker.endswith(".NS") else raw_ticker + ".NS")
+
+            entry_price = float(parts[1])
+            target_price = float(parts[2])
+            fetch_ticker = get_fetch_ticker(ticker, "1d")
+            currency = get_currency_symbol(ticker)
+
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO trades (chat_id, ticker, fetch_ticker, entry_price, target_price, currency, status, last_alerted_candle)
+                VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', NULL)
+            ''', (chat_id, ticker, fetch_ticker, entry_price, target_price, currency))
+            conn.commit()
+            conn.close()
+
+            saved_count += 1
+        except Exception as e:
+            logging.error(f"Error parsing trade line '{line}': {e}")
+            errors.append(f"Failed line: `{line}`")
+
+    reply_msg = f"🎯 Saved *{saved_count}* trade target(s)!"
+    if errors:
+        reply_msg += "\n\n⚠️ *Issues:* \n" + "\n".join(errors)
+
+    await update.message.reply_text(reply_msg, parse_mode="Markdown")
 
 async def list_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -432,5 +445,5 @@ if __name__ == "__main__":
     job_queue = app.job_queue
     job_queue.run_repeating(scanner_job, interval=60, first=5)
 
-    print("🚀 Crash-proof Bot online!")
+    print("🚀 Multi-line Bot Online!")
     app.run_polling()
