@@ -14,7 +14,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-DB_FILE = "alerts.db"
+DB_FILE = "bot_data.db"
 
 VALID_TIMEFRAMES = {
     "5m": "5d",
@@ -25,10 +25,10 @@ VALID_TIMEFRAMES = {
     "1d": "6mo"
 }
 
-# Database Initialization
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
+    # Price Level Alerts Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,6 +43,20 @@ def init_db():
             last_alerted_candle TEXT
         )
     ''')
+    # Trade Targets Table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER,
+            ticker TEXT,
+            fetch_ticker TEXT,
+            entry_price REAL,
+            target_price REAL,
+            currency TEXT,
+            status TEXT DEFAULT 'ACTIVE',
+            last_alerted_candle TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -53,7 +67,7 @@ def get_currency_symbol(ticker: str) -> str:
         return "₹"
     return "$"
 
-def get_fetch_ticker(ticker: str, timeframe: str) -> str:
+def get_fetch_ticker(ticker: str, timeframe: str = "1d") -> str:
     if ticker in ["XAUUSD=X", "XAUUSD"] and timeframe in ["5m", "15m", "45m"]:
         return "GC=F"
     return ticker
@@ -86,12 +100,11 @@ def calculate_rsi(close_series: pd.Series, period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return round(100.0 - (100.0 / (1.0 + rs)), 1)
 
-# Health Check Server for Render
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is alive with SQLite Persistent Alerts!")
+        self.wfile.write(b"Unified Stock Bot with Live CMP List is running!")
 
 def run_health_check_server():
     port = int(os.environ.get("PORT", 8080))
@@ -103,13 +116,16 @@ threading.Thread(target=run_health_check_server, daemon=True).start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🤖 *Welcome to @stockdotbot! (Persistent Edition)*\n\n"
-        "Set an alert:\n"
-        "`/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`\n\n"
-        "Examples:\n"
-        "• `/alert TATAMOTORS 980 15m 1020`\n"
-        "• `/alert XAUUSD=X 2650 15m 2700`\n\n"
-        "Check alerts: `/list` | Clear all: `/clear`"
+        "🤖 *Welcome to @stockdotbot!*\n\n"
+        "1️⃣ *Set Price Breakout Alert:*\n"
+        "`/alert <TICKER> <TRIGGER_PRICE> <TIMEFRAME> [TARGET_PRICE]`\n"
+        "• Example: `/alert ROLEXRINGS 190 1h 197.90`\n\n"
+        "2️⃣ *Set Trade Target:*\n"
+        "`/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`\n"
+        "• Example: `/trade TEXRAIL 127.20 143`\n\n"
+        "📋 *Management Commands:*\n"
+        "• `/list` - View active alerts & trade targets with Live CMP\n"
+        "• `/clear` - Wipe all active alerts & trade targets"
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
@@ -118,11 +134,8 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         raw_ticker = context.args[0].upper()
         
-        is_global_asset = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
-        if not is_global_asset and not raw_ticker.endswith(".NS"):
-            ticker = raw_ticker + ".NS"
-        else:
-            ticker = raw_ticker
+        is_global = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
+        ticker = raw_ticker if is_global else (raw_ticker if raw_ticker.endswith(".NS") else raw_ticker + ".NS")
 
         target_price = float(context.args[1])
         tf = context.args[2].lower()
@@ -132,11 +145,9 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         tp_price = float(context.args[3]) if len(context.args) > 3 else None
-
         fetch_ticker = get_fetch_ticker(ticker, tf)
-        period = VALID_TIMEFRAMES[tf]
         
-        df = yf.Ticker(fetch_ticker).history(period=period, interval=tf)
+        df = yf.Ticker(fetch_ticker).history(period=VALID_TIMEFRAMES[tf], interval=tf)
         if df.empty:
             await update.message.reply_text(f"❌ Could not fetch live data for `{ticker}`.", parse_mode="Markdown")
             return
@@ -145,7 +156,6 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         direction = "ABOVE" if target_price >= current_price else "BELOW"
         currency = get_currency_symbol(ticker)
 
-        # Save alert directly to SQLite Database
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
         cursor.execute('''
@@ -156,8 +166,9 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
         reply_msg = (
-            f"✅ *Alert Saved to Database!*\n"
+            f"✅ *Alert Saved!*\n"
             f"• Stock: `{ticker}`\n"
+            f"• CMP: `{currency}{current_price:.2f}`\n"
             f"• Trigger Level: `{currency}{target_price:.2f}` ({direction})\n"
             f"• Timeframe: `{tf}`"
         )
@@ -171,68 +182,141 @@ async def add_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-async def list_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_trade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    try:
+        raw_ticker = context.args[0].upper()
+        
+        is_global = ("=" in raw_ticker or "XAU" in raw_ticker or "USD" in raw_ticker or "^" in raw_ticker or raw_ticker.endswith(".BO"))
+        ticker = raw_ticker if is_global else (raw_ticker if raw_ticker.endswith(".NS") else raw_ticker + ".NS")
+
+        entry_price = float(context.args[1])
+        target_price = float(context.args[2])
+        fetch_ticker = get_fetch_ticker(ticker, "1d")
+
+        currency = get_currency_symbol(ticker)
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO trades (chat_id, ticker, fetch_ticker, entry_price, target_price, currency, status, last_alerted_candle)
+            VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', NULL)
+        ''', (chat_id, ticker, fetch_ticker, entry_price, target_price, currency))
+        conn.commit()
+        conn.close()
+
+        reply_msg = (
+            f"🎯 *Trade Target Active!*\n"
+            f"• Stock: `{ticker}`\n"
+            f"• Entry Price: `{currency}{entry_price:.2f}`\n"
+            f"• Target Price: `{currency}{target_price:.2f}` 🎯"
+        )
+        await update.message.reply_text(reply_msg, parse_mode="Markdown")
+    except (IndexError, ValueError):
+        await update.message.reply_text(
+            "❌ *Invalid format.*\nUse: `/trade <TICKER> <ENTRY_PRICE> <TARGET_PRICE>`",
+            parse_mode="Markdown"
+        )
+
+async def list_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("SELECT ticker, direction, currency, target_price, timeframe, tp_price FROM alerts WHERE chat_id = ?", (chat_id,))
-    rows = cursor.fetchall()
+    cursor.execute("SELECT ticker, fetch_ticker, direction, currency, target_price, timeframe, tp_price FROM alerts WHERE chat_id = ?", (chat_id,))
+    alerts = cursor.fetchall()
+
+    cursor.execute("SELECT ticker, fetch_ticker, entry_price, target_price, currency FROM trades WHERE chat_id = ? AND status = 'ACTIVE'", (chat_id,))
+    trades = cursor.fetchall()
     conn.close()
 
-    if not rows:
-        await update.message.reply_text("No active alerts.")
+    if not alerts and not trades:
+        await update.message.reply_text("No active alerts or trade targets.")
         return
 
-    text = "📋 *Active Watchlist (Persistent):*\n\n"
-    for idx, row in enumerate(rows, 1):
-        ticker, direction, curr, target_price, tf, tp_price = row
-        tp_str = f" | Target: `{curr}{tp_price}`" if tp_price else ""
-        text += f"{idx}. `{ticker}` | Trigger: {direction} `{curr}{target_price}` | TF: `{tf}`{tp_str}\n"
+    await update.message.reply_text("⏳ *Fetching live CMP for your watchlist...*", parse_mode="Markdown")
+
+    text = ""
+    if alerts:
+        text += "🚨 *Active Price Alerts:*\n"
+        for idx, a in enumerate(alerts, 1):
+            ticker, fetch_ticker, direction, curr, target_price, tf, tp_price = a
+            
+            # Fetch Live CMP
+            try:
+                df = yf.Ticker(fetch_ticker).history(period="5d", interval="1d")
+                cmp_val = float(df.iloc[-1]['Close']) if not df.empty else None
+                cmp_str = f"`{curr}{cmp_val:.2f}`" if cmp_val else "N/A"
+            except Exception:
+                cmp_str = "N/A"
+
+            tp_str = f" | Target: `{curr}{tp_price}`" if tp_price else ""
+            text += f"{idx}. `{ticker}` | CMP: {cmp_str} | Trigger: {direction} `{curr}{target_price}` | TF: `{tf}`{tp_str}\n"
+        text += "\n"
+
+    if trades:
+        text += "🎯 *Active Trade Targets:*\n"
+        for idx, t in enumerate(trades, 1):
+            ticker, fetch_ticker, entry_price, target, curr = t
+            
+            # Fetch Live CMP & P&L
+            try:
+                df = yf.Ticker(fetch_ticker).history(period="5d", interval="1d")
+                cmp_val = float(df.iloc[-1]['Close']) if not df.empty else None
+                if cmp_val:
+                    pnl_pct = ((cmp_val - entry_price) / entry_price) * 100
+                    pnl_sign = "+" if pnl_pct >= 0 else ""
+                    cmp_str = f"`{curr}{cmp_val:.2f}` ({pnl_sign}{pnl_pct:.2f}%)"
+                else:
+                    cmp_str = "N/A"
+            except Exception:
+                cmp_str = "N/A"
+
+            text += f"{idx}. `{ticker}` | Entry: `{curr}{entry_price:.2f}` | CMP: {cmp_str} | Target: `{curr}{target:.2f}`\n"
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
-async def clear_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def clear_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM alerts WHERE chat_id = ?", (chat_id,))
+    cursor.execute("DELETE FROM trades WHERE chat_id = ?", (chat_id,))
     conn.commit()
     conn.close()
 
-    await update.message.reply_text("🧹 Cleared all alerts from database.")
+    await update.message.reply_text("🧹 Cleared all active alerts and trade targets.")
 
-async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
+async def scanner_job(context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("SELECT id, chat_id, ticker, fetch_ticker, target_price, direction, timeframe, currency, tp_price, last_alerted_candle FROM alerts")
     alerts = cursor.fetchall()
+
+    cursor.execute("SELECT id, chat_id, ticker, fetch_ticker, entry_price, target_price, currency, last_alerted_candle FROM trades WHERE status = 'ACTIVE'")
+    trades = cursor.fetchall()
     conn.close()
 
-    if not alerts:
-        return
+    triggered_alerts = []
+    updated_trades = []
 
-    triggered_ids = []
-
+    # 1. Process Price Alerts
     for alert in alerts:
-        alert_id, chat_id, ticker, fetch_ticker, target, direction, tf, currency, tp_price, last_alerted_candle = alert
-        period = VALID_TIMEFRAMES[tf]
+        aid, chat_id, ticker, fetch_ticker, target, direction, tf, currency, tp_price, last_alerted_candle = alert
 
         try:
-            df = yf.Ticker(fetch_ticker).history(period=period, interval=tf)
+            df = yf.Ticker(fetch_ticker).history(period=VALID_TIMEFRAMES[tf], interval=tf)
             if df.empty or len(df) < 2:
                 continue
 
             closed_df = df.iloc[:-1]
             last_closed = closed_df.iloc[-1]
-            
             close_price = float(last_closed['Close'])
             candle_volume = float(last_closed['Volume'])
             candle_time = last_closed.name.strftime('%Y-%m-%d %H:%M')
 
             rsi_val = calculate_rsi(closed_df['Close'], period=14)
-
             vol_series = closed_df['Volume']
             vol_sma60 = float(vol_series.iloc[-60:].mean()) if len(vol_series) >= 60 else float(vol_series.mean())
             vol_ratio60 = (candle_volume / vol_sma60) if vol_sma60 > 0 else 1.0
@@ -243,33 +327,74 @@ async def check_breakouts_job(context: ContextTypes.DEFAULT_TYPE):
             elif direction == "BELOW" and close_price < target:
                 is_triggered = True
 
-            if is_triggered:
-                if last_alerted_candle != candle_time:
-                    formatted_vol = format_volume(candle_volume) if candle_volume > 0 else "N/A"
-                    vol_output = f"{formatted_vol} ({vol_ratio60:.1f}x 60-SMA)" if candle_volume > 0 else "N/A"
-                    tp_val = f"{currency}{tp_price:.2f}" if tp_price else "N/A"
+            if is_triggered and last_alerted_candle != candle_time:
+                formatted_vol = format_volume(candle_volume) if candle_volume > 0 else "N/A"
+                vol_output = f"{formatted_vol} ({vol_ratio60:.1f}x 60-SMA)" if candle_volume > 0 else "N/A"
+                tp_val = f"{currency}{tp_price:.2f}" if tp_price else "N/A"
 
-                    msg = (
-                        f"🚨 *ALERT TRIGGERED* 🚨\n\n"
-                        f"• Stock: *{ticker}*\n"
-                        f"• RSI: *{rsi_val}*\n"
-                        f"• Volume: *{vol_output}*\n"
-                        f"• Entry Price: *{currency}{close_price:.2f}*\n"
-                        f"• Target Price: *{tp_val}*"
-                    )
-                    await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-                    triggered_ids.append(alert_id)
+                msg = (
+                    f"🚨 *ALERT TRIGGERED* 🚨\n\n"
+                    f"• Stock: *{ticker}*\n"
+                    f"• RSI: *{rsi_val}*\n"
+                    f"• Volume: *{vol_output}*\n"
+                    f"• Entry Price: *{currency}{close_price:.2f}*\n"
+                    f"• Target Price: *{tp_val}*"
+                )
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                triggered_alerts.append(aid)
 
         except Exception as e:
-            logging.error(f"Error scanning {ticker}: {e}")
+            logging.error(f"Error scanning alert {ticker}: {e}")
 
-    # Delete triggered alerts from database
-    if triggered_ids:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.executemany("DELETE FROM alerts WHERE id = ?", [(aid,) for aid in triggered_ids])
-        conn.commit()
-        conn.close()
+    # 2. Process Trade Targets (1d Timeframe)
+    for trade in trades:
+        tid, chat_id, ticker, fetch_ticker, entry_price, target, currency, last_alerted_candle = trade
+
+        try:
+            df = yf.Ticker(fetch_ticker).history(period="6mo", interval="1d")
+            if df.empty or len(df) < 2:
+                continue
+
+            closed_df = df.iloc[:-1]
+            last_closed = closed_df.iloc[-1]
+            close_price = float(last_closed['Close'])
+            candle_volume = float(last_closed['Volume'])
+            candle_time = last_closed.name.strftime('%Y-%m-%d %H:%M')
+
+            rsi_val = calculate_rsi(closed_df['Close'], period=14)
+            vol_series = closed_df['Volume']
+            vol_sma60 = float(vol_series.iloc[-60:].mean()) if len(vol_series) >= 60 else float(vol_series.mean())
+            vol_ratio60 = (candle_volume / vol_sma60) if vol_sma60 > 0 else 1.0
+
+            if close_price >= target and last_alerted_candle != candle_time:
+                pnl_pct = ((close_price - entry_price) / entry_price) * 100
+                formatted_vol = format_volume(candle_volume) if candle_volume > 0 else "N/A"
+                vol_output = f"{formatted_vol} ({vol_ratio60:.1f}x 60-SMA)" if candle_volume > 0 else "N/A"
+
+                msg = (
+                    f"🎉 *TARGET ACHIEVED!* 🎯\n\n"
+                    f"• Stock: *{ticker}*\n"
+                    f"• Return: *+{pnl_pct:.2f}%* 📈\n"
+                    f"• Target Price: *{currency}{target:.2f}*\n"
+                    f"• Candle Close: *{currency}{close_price:.2f}*\n"
+                    f"• RSI: *{rsi_val}*\n"
+                    f"• Volume: *{vol_output}*"
+                )
+                await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                updated_trades.append(("TARGET_ACHIEVED", candle_time, tid))
+
+        except Exception as e:
+            logging.error(f"Error scanning trade {ticker}: {e}")
+
+    # Remove triggered alerts & update finished trades
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    if triggered_alerts:
+        cursor.executemany("DELETE FROM alerts WHERE id = ?", [(aid,) for aid in triggered_alerts])
+    if updated_trades:
+        cursor.executemany("UPDATE trades SET status = ?, last_alerted_candle = ? WHERE id = ?", updated_trades)
+    conn.commit()
+    conn.close()
 
 if __name__ == "__main__":
     BOT_TOKEN = "8964779286:AAEJJfB49NFgVxR8zMOvImegNrlRaqEjcHA"
@@ -278,11 +403,12 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("alert", add_alert))
-    app.add_handler(CommandHandler("list", list_alerts))
-    app.add_handler(CommandHandler("clear", clear_alerts))
+    app.add_handler(CommandHandler("trade", add_trade))
+    app.add_handler(CommandHandler("list", list_all))
+    app.add_handler(CommandHandler("clear", clear_all))
 
     job_queue = app.job_queue
-    job_queue.run_repeating(check_breakouts_job, interval=60, first=5)
+    job_queue.run_repeating(scanner_job, interval=60, first=5)
 
-    print("🚀 @stockdotbot is online with SQLite database persistence!")
+    print("🚀 Unified Bot Online (Live CMP List Enabled)!")
     app.run_polling()
